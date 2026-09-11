@@ -1,24 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+target/
+src-tauri/target/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
 # Logs
-logs
 *.log
 npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
+# OS files
+.DS_Store
+Thumbs.db
 
-# Editor directories and files
+# Editor
 .vscode/*
 !.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
+
+# Meeting Notes Assistant data - never commit real meeting content
+meetings/
+*.wav
+*.mp3
+transcript.json
+transcript.md
+notes.md
+mom.json
+mom_generated.md
+mom_final.md
