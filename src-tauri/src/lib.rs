@@ -3,6 +3,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager, WindowEvent,
 };
+mod teams;
 
 // Phase 1 scope only (IMPLEMENTATION_PLAN.md):
 //   - application window
@@ -57,7 +58,8 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
-
+                let handle = app.handle().clone();
+                teams::start_detector(handle);
             Ok(())
         })
         .on_window_event(|window, event| {
