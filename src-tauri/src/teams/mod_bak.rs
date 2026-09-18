@@ -34,7 +34,7 @@
 use std::thread;
 use std::time::Duration;
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -173,13 +173,6 @@ fn poll_once(current: &mut DetectorState, app: &AppHandle) {
 
         if new_state == DetectorState::MeetingActive {
             let _ = app.emit("teams-meeting-detected", ());
-            // Bring the window forward specifically for this prompt.
-            // UI_UX_SPECIFICATION.md §42: the app may auto-show itself
-            // ONLY for the meeting-detection prompt, nothing else.
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
         } else if *current == DetectorState::MeetingActive {
             // Leaving MeetingActive either to Running or NotRunning both
             // count as "meeting ended" - covers Teams closing abruptly
