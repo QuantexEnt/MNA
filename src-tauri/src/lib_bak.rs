@@ -1,11 +1,16 @@
-mod audio;
-mod teams;
-
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager, WindowEvent,
 };
+mod teams;
+
+// Phase 1 scope only (IMPLEMENTATION_PLAN.md):
+//   - application window
+//   - system tray with Open / Exit
+//   - minimize-to-tray instead of quitting on close
+//   - explicit Exit actually terminates the app
+// Nothing about Teams detection, audio, or OpenAI belongs in this file yet.
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -19,6 +24,9 @@ pub fn run() {
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("Meeting Notes Assistant")
                 .menu(&menu)
+                // Don't pop the menu on a plain left-click; left-click should
+                // restore the window instead (handled below). Right-click
+                // still shows the menu (default Tauri behavior).
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => {
@@ -28,6 +36,9 @@ pub fn run() {
                         }
                     }
                     "quit" => {
+                        // Explicit Exit: DECISIONS.md #037 requires this to
+                        // actually terminate the app, unlike closing the
+                        // window (which only hides it - see below).
                         app.exit(0);
                     }
                     _ => {}
@@ -47,23 +58,20 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
-
-            // Phase 2: start Teams meeting detection in the background.
-            let handle = app.handle().clone();
-            teams::start_detector(handle);
-
+                let handle = app.handle().clone();
+                teams::start_detector(handle);
             Ok(())
         })
         .on_window_event(|window, event| {
+            // Minimize-to-tray: closing the window (the X button) hides it
+            // rather than quitting the app. Only the tray's explicit "Exit"
+            // item terminates the process. Per DECISIONS.md #037.
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
             }
         })
-        .invoke_handler(tauri::generate_handler![
-            audio::start_recording,
-            audio::stop_recording
-        ])
+        .invoke_handler(tauri::generate_handler![])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
