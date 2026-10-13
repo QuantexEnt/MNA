@@ -1,0 +1,154 @@
+//! Real dual-source meeting audio recorder (device loopback + gated mic).
+//! Built from three separately-validated POCs, composed per the
+//! architecture agreed in DECISIONS.md #013-A.
+//!
+//! Storage: saves to a permanent app-owned location (LOCAL_STORAGE_
+//! SPECIFICATION.md §3), not a temp folder - recordings need to survive
+//! for later phases (transcription). Full per-meeting folder structure
+//! with meeting.json etc. is still Phase 5/6 - this is a flat timestamped
+//! file for now, deliberately not over-built ahead of session management.
+
+mod loopback;
+mod merge;
+mod mic_gated;
+mod mute_watcher;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+use tauri::{AppHandle, Manager};
+
+struct ActiveRecording {
+    should_stop: Arc<AtomicBool>,
+    loopback_handle: JoinHandle<()>,
+    mic_handle: JoinHandle<()>,
+    loopback_temp_path: String,
+    mic_temp_path: String,
+    final_output_path: String,
+}
+
+static ACTIVE: Mutex<Option<ActiveRecording>> = Mutex::new(None);
+
+fn recordings_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("could not resolve app data directory: {e}"))?;
+    let dir = base.join("recordings");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create recordings dir: {e}"))?;
+    Ok(dir)
+}
+
+/// Starts recording. Returns the path the final merged file will be
+/// written to once stop_recording() is called.
+#[tauri::command]
+pub fn start_recording(app: AppHandle) -> Result<String, String> {
+    let mut active = ACTIVE
+        .lock()
+        .map_err(|_| "recording state lock poisoned".to_string())?;
+    if active.is_some() {
+        return Err("a recording is already active".to_string());
+    }
+
+    let dir = recordings_dir(&app)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let final_output_path = dir
+        .join(format!("meeting_{timestamp}.wav"))
+        .to_string_lossy()
+        .to_string();
+    let loopback_temp_path = format!("{final_output_path}.loopback_temp.wav");
+    let mic_temp_path = format!("{final_output_path}.mic_temp.wav");
+
+    let should_stop = Arc::new(AtomicBool::new(false));
+    // Fail-closed default: mic gate starts CLOSED until the watcher
+    // positively confirms "unmuted" (DECISIONS.md #013-A).
+    let is_unmuted = Arc::new(AtomicBool::new(false));
+
+    mute_watcher::start_watching(is_unmuted.clone(), should_stop.clone());
+
+    let lb_path = loopback_temp_path.clone();
+    let lb_stop = should_stop.clone();
+    let loopback_handle = std::thread::spawn(move || {
+        if let Err(e) = loopback::run_loopback_capture(lb_path, lb_stop) {
+            eprintln!("[audio] loopback capture error: {e:?}");
+        }
+    });
+
+    let mic_path = mic_temp_path.clone();
+    let mic_stop = should_stop.clone();
+    let mic_handle = std::thread::spawn(move || {
+        if let Err(e) = mic_gated::run_gated_mic_capture(mic_path, is_unmuted, mic_stop) {
+            eprintln!("[audio] mic capture error: {e:?}");
+        }
+    });
+
+    println!("[audio] Recording started. Will save to: {final_output_path}");
+
+    *active = Some(ActiveRecording {
+        should_stop,
+        loopback_handle,
+        mic_handle,
+        loopback_temp_path,
+        mic_temp_path,
+        final_output_path: final_output_path.clone(),
+    });
+
+    Ok(final_output_path)
+}
+
+fn do_stop(recording: ActiveRecording) -> Result<String, String> {
+    recording.should_stop.store(true, Ordering::SeqCst);
+    let _ = recording.loopback_handle.join();
+    let _ = recording.mic_handle.join();
+
+    println!("[audio] Recording stopped. Merging temp files...");
+
+    merge::merge_wav_files(
+        &recording.loopback_temp_path,
+        &recording.mic_temp_path,
+        &recording.final_output_path,
+    )?;
+
+    println!(
+        "[audio] Merged recording saved to: {}",
+        recording.final_output_path
+    );
+
+    Ok(recording.final_output_path)
+}
+
+/// Manual stop, called from the UI's "Stop & Save" button. Errors if
+/// nothing is currently recording.
+#[tauri::command]
+pub fn stop_recording() -> Result<String, String> {
+    let recording = {
+        let mut active = ACTIVE
+            .lock()
+            .map_err(|_| "recording state lock poisoned".to_string())?;
+        active.take()
+    };
+
+    let Some(recording) = recording else {
+        return Err("no active recording".to_string());
+    };
+
+    do_stop(recording)
+}
+
+/// Auto-stop, called internally when a Teams meeting ends. Unlike
+/// stop_recording(), this is a no-op (returns None) if nothing is
+/// active - ending a meeting the user never chose to record is not an
+/// error condition.
+pub fn stop_recording_if_active() -> Option<Result<String, String>> {
+    let recording = {
+        let mut active = ACTIVE.lock().ok()?;
+        active.take()
+    }?;
+
+    Some(do_stop(recording))
+}

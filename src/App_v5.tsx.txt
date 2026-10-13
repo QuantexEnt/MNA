@@ -1,0 +1,113 @@
+import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { MeetingNotification } from "./components/MeetingNotification";
+import { SettingsPage } from "./components/SettingsPage";
+import { HistoryPage } from "./components/HistoryPage";
+import logo from "./assets/Horizontal-_MNA.png";
+
+type Page = "meeting" | "history" | "settings";
+
+function NavItem({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        padding: "8px 16px",
+        fontSize: "13px",
+        cursor: "pointer",
+        color: active ? "#147DFF" : "#6F7F98",
+        fontWeight: active ? 600 : 400,
+        borderLeft: active ? "3px solid #147DFF" : "3px solid transparent",
+      }}
+    >
+      {label}
+    </div>
+  );
+}
+
+function App() {
+  const [page, setPage] = useState<Page>("meeting");
+
+  return (
+    <div
+      style={{
+        fontFamily: "Inter, -apple-system, sans-serif",
+        display: "flex",
+        flexDirection: "column",
+        height: "100vh",
+      }}
+    >
+      <header
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "10px 16px",
+          borderBottom: "1px solid #DCE3F0",
+          flexShrink: 0,
+        }}
+      >
+        <img src={logo} alt="Meeting Note Assistant" style={{ height: "24px" }} />
+        <button
+          onClick={() => invoke("exit_app")}
+          title="Quit the app completely (finishes and saves any active recording first)"
+          style={{
+            background: "transparent",
+            color: "#C73636",
+            border: "1px solid #F3D2D2",
+            borderRadius: "4px",
+            padding: "5px 12px",
+            fontSize: "12px",
+            fontWeight: 600,
+            cursor: "pointer",
+          }}
+        >
+          Exit
+        </button>
+      </header>
+
+      {/* Always mounted regardless of active tab - fixes the bug where
+          meeting detection stopped working while on History/Settings,
+          and keeps recording controls/notes accessible from any tab. */}
+      <MeetingNotification />
+
+      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+        <nav
+          style={{
+            width: "140px",
+            background: "#F8FAFF",
+            borderRight: "1px solid #DCE3F0",
+            padding: "12px 0",
+            flexShrink: 0,
+          }}
+        >
+          <NavItem label="Meeting" active={page === "meeting"} onClick={() => setPage("meeting")} />
+          <NavItem label="History" active={page === "history"} onClick={() => setPage("history")} />
+          <NavItem label="Settings" active={page === "settings"} onClick={() => setPage("settings")} />
+        </nav>
+
+        <main style={{ flex: 1, overflow: "auto" }}>
+          {page === "meeting" && (
+            <div style={{ padding: "20px" }}>
+              <p style={{ color: "#6F7F98" }}>
+                Running in the background. Waiting for a Teams meeting...
+              </p>
+            </div>
+          )}
+          {page === "history" && <HistoryPage />}
+          {page === "settings" && <SettingsPage />}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+export default App;

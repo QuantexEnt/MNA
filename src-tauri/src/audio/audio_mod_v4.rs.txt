@@ -1,0 +1,185 @@
+//! Real dual-source meeting audio recorder (device loopback + gated mic).
+//! Built from three separately-validated POCs, composed per the
+//! architecture agreed in DECISIONS.md #013-A.
+//!
+//! DEV-ONLY STORAGE NOTE: recordings currently save to a "recordings"
+//! folder inside the project itself (MNA/recordings), per explicit
+//! request for easy access during development. This MUST move to a
+//! proper user data location before any real/production use
+//! (LOCAL_STORAGE_SPECIFICATION.md §3, SECURITY_AND_PRIVACY.md §21) -
+//! revisit in Phase 6 (Local Storage). The folder is covered by the
+//! existing *.wav / recordings/ .gitignore rules so nothing here risks
+//! being committed.
+
+mod loopback;
+mod merge;
+mod mic_gated;
+mod mute_watcher;
+
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+use windows::Win32::Media::Audio::{
+    eConsole, eRender, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
+};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
+};
+
+struct ActiveRecording {
+    should_stop: Arc<AtomicBool>,
+    loopback_handle: JoinHandle<()>,
+    mic_handle: JoinHandle<()>,
+    loopback_temp_path: String,
+    mic_temp_path: String,
+    final_output_path: String,
+}
+
+static ACTIVE: Mutex<Option<ActiveRecording>> = Mutex::new(None);
+
+fn recordings_dir() -> Result<std::path::PathBuf, String> {
+    // CARGO_MANIFEST_DIR points at src-tauri/ (where Cargo.toml lives);
+    // go up one level to reach the MNA project root.
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let project_root = manifest_dir.join("..");
+    let dir = project_root.join("recordings");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create recordings dir: {e}"))?;
+    Ok(dir)
+}
+
+/// Quickly queries the render (output) device's native mix format, so
+/// the mic capture thread can be told to explicitly match it. Fixes a
+/// real bug found in testing: default render and capture devices ran
+/// at different native sample rates (44.1kHz vs 48kHz), and merging
+/// mismatched-rate streams would produce corrupted audio.
+fn probe_render_format() -> Result<(u16, u32, u16), String> {
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED)
+            .ok()
+            .map_err(|e| e.to_string())?;
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eRender, eConsole)
+            .map_err(|e| e.to_string())?;
+        let audio_client: IAudioClient =
+            device.Activate(CLSCTX_ALL, None).map_err(|e| e.to_string())?;
+        let wf_ptr = audio_client.GetMixFormat().map_err(|e| e.to_string())?;
+        let wf = *wf_ptr;
+        let result = (wf.nChannels, wf.nSamplesPerSec, wf.wBitsPerSample);
+        CoTaskMemFree(Some(wf_ptr as *const c_void));
+        Ok(result)
+    }
+}
+
+#[tauri::command]
+pub fn start_recording() -> Result<String, String> {
+    let mut active = ACTIVE
+        .lock()
+        .map_err(|_| "recording state lock poisoned".to_string())?;
+    if active.is_some() {
+        return Err("a recording is already active".to_string());
+    }
+
+    let dir = recordings_dir()?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let final_output_path = dir
+        .join(format!("meeting_{timestamp}.wav"))
+        .to_string_lossy()
+        .to_string();
+    let loopback_temp_path = format!("{final_output_path}.loopback_temp.wav");
+    let mic_temp_path = format!("{final_output_path}.mic_temp.wav");
+
+    let (channels, sample_rate, bits) = std::thread::spawn(probe_render_format)
+        .join()
+        .map_err(|_| "format probe thread panicked".to_string())??;
+    println!("[audio] Target format (from render device): {channels}ch {sample_rate}Hz {bits}bit");
+
+    let should_stop = Arc::new(AtomicBool::new(false));
+    let is_unmuted = Arc::new(AtomicBool::new(false));
+
+    mute_watcher::start_watching(is_unmuted.clone(), should_stop.clone());
+
+    let lb_path = loopback_temp_path.clone();
+    let lb_stop = should_stop.clone();
+    let loopback_handle = std::thread::spawn(move || {
+        if let Err(e) = loopback::run_loopback_capture(lb_path, lb_stop) {
+            eprintln!("[audio] loopback capture error: {e:?}");
+        }
+    });
+
+    let mic_path = mic_temp_path.clone();
+    let mic_stop = should_stop.clone();
+    let mic_handle = std::thread::spawn(move || {
+        if let Err(e) = mic_gated::run_gated_mic_capture(
+            mic_path, is_unmuted, mic_stop, channels, sample_rate, bits,
+        ) {
+            eprintln!("[audio] mic capture error: {e:?}");
+        }
+    });
+
+    println!("[audio] Recording started. Will save to: {final_output_path}");
+
+    *active = Some(ActiveRecording {
+        should_stop,
+        loopback_handle,
+        mic_handle,
+        loopback_temp_path,
+        mic_temp_path,
+        final_output_path: final_output_path.clone(),
+    });
+
+    Ok(final_output_path)
+}
+
+fn do_stop(recording: ActiveRecording) -> Result<String, String> {
+    recording.should_stop.store(true, Ordering::SeqCst);
+    let _ = recording.loopback_handle.join();
+    let _ = recording.mic_handle.join();
+
+    println!("[audio] Recording stopped. Merging temp files...");
+
+    merge::merge_wav_files(
+        &recording.loopback_temp_path,
+        &recording.mic_temp_path,
+        &recording.final_output_path,
+    )?;
+
+    println!(
+        "[audio] Merged recording saved to: {}",
+        recording.final_output_path
+    );
+
+    Ok(recording.final_output_path)
+}
+
+#[tauri::command]
+pub fn stop_recording() -> Result<String, String> {
+    let recording = {
+        let mut active = ACTIVE
+            .lock()
+            .map_err(|_| "recording state lock poisoned".to_string())?;
+        active.take()
+    };
+
+    let Some(recording) = recording else {
+        return Err("no active recording".to_string());
+    };
+
+    do_stop(recording)
+}
+
+pub fn stop_recording_if_active() -> Option<Result<String, String>> {
+    let recording = {
+        let mut active = ACTIVE.lock().ok()?;
+        active.take()
+    }?;
+
+    Some(do_stop(recording))
+}

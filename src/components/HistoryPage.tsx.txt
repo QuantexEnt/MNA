@@ -1,0 +1,85 @@
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+
+// Real History page - scans meetings/ via the list_meetings command and
+// shows each meeting's title, date, and status. No transcript/MOM view
+// yet since those phases don't exist - this just proves the meeting
+// list itself works end to end.
+
+interface MeetingMetadata {
+  id: string;
+  title: string;
+  started_at: string;
+  ended_at: string | null;
+  status: string;
+  audio: { path: string; duration_seconds: number | null } | null;
+}
+
+export function HistoryPage() {
+  const [meetings, setMeetings] = useState<MeetingMetadata[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    invoke<MeetingMetadata[]>("list_meetings")
+      .then((result) => {
+        setMeetings(result);
+        setLoading(false);
+      })
+      .catch((err) => {
+        console.error("[history] Failed to load meetings:", err);
+        setLoading(false);
+      });
+  }, []);
+
+  if (loading) {
+    return <div style={{ padding: "20px", color: "#6F7F98", fontSize: "13px" }}>Loading...</div>;
+  }
+
+  if (meetings.length === 0) {
+    return (
+      <div style={{ padding: "20px", color: "#6F7F98", fontSize: "13px" }}>
+        <p>No meetings yet.</p>
+        <p style={{ fontSize: "12px" }}>
+          When you take notes during a Teams meeting, your meetings will
+          appear here.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ padding: "20px" }}>
+      {meetings.map((m) => (
+        <div
+          key={m.id}
+          style={{
+            padding: "12px 0",
+            borderBottom: "1px solid #DCE3F0",
+            display: "flex",
+            justifyContent: "space-between",
+            fontSize: "13px",
+          }}
+        >
+          <div>
+            <div style={{ fontWeight: 600, color: "#12244A" }}>{m.title}</div>
+            <div style={{ color: "#6F7F98", fontSize: "12px" }}>
+              {new Date(m.started_at).toLocaleString()}
+            </div>
+          </div>
+          <span
+            style={{
+              alignSelf: "center",
+              fontSize: "11px",
+              padding: "2px 8px",
+              borderRadius: "10px",
+              background: m.status === "COMPLETED" ? "#F1F3FF" : "#FDF2F2",
+              color: m.status === "COMPLETED" ? "#147DFF" : "#C73636",
+            }}
+          >
+            {m.status}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}

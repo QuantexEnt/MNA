@@ -1,47 +1,110 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
+import { NotesEditor } from "./NotesEditor";
+import { MeetingMetadata } from "./TranscriptViewer";
 
-// Phase 3 scope only (IMPLEMENTATION_PLAN.md):
-//   - show a Start/Not Now popup when a meeting is detected
-//   - track whether the user dismissed THIS meeting instance (no repeat
-//     prompts per DECISIONS.md §9 / USER_FLOW.md §6)
-//   - reset when the meeting ends, ready for the next one
-//   - NO actual audio capture starts here - "Start Taking Notes" only
-//     transitions local UI state for now. Audio capture is a later phase,
-//     wired in only once the real recorder exists (DECISIONS.md §013-A).
+// Phase 3 + recording lifecycle:
+//   - show Start/Not Now popup when a meeting is detected
+//   - on Start: actually begin recording (DECISIONS.md #013-A recorder)
+//   - while recording: show a visible indicator + elapsed time + a
+//     manual Stop & Save button (DECISIONS.md #038 - recording state
+//     must always be visible)
+//   - auto-reset when the backend reports the meeting ended (which also
+//     triggers the backend's own auto-stop if still recording)
 //
-// DECISIONS.md #009 requirement this satisfies: no recording begins
-// merely because a meeting was detected - only on explicit user action.
+// Meeting Review redirect (Phase 9): after a recording stops - either
+// manually (Stop & Save) or automatically (Teams meeting ended while
+// recording) - the app navigates to the Meeting Review screen for that
+// meeting. The just-ended meeting's ID isn't directly returned by
+// stop_recording, so this fetches list_meetings (already sorted newest
+// first) and takes the top entry, reusing already-tested code rather
+// than parsing an unfamiliar return value.
 
-type SessionState = "idle" | "awaiting_decision" | "dismissed" | "active";
+type SessionState = "idle" | "awaiting_decision" | "dismissed" | "recording";
 
-export function MeetingNotification() {
+interface MeetingNotificationProps {
+  onMeetingEnded?: (meeting: MeetingMetadata) => void;
+}
+
+export function MeetingNotification({ onMeetingEnded }: MeetingNotificationProps) {
   const [state, setState] = useState<SessionState>("idle");
+  const [elapsedSec, setElapsedSec] = useState(0);
+  const [lastSavedPath, setLastSavedPath] = useState<string | null>(null);
+  const timerRef = useRef<number | null>(null);
+  // Tracks the latest `state` for use inside the teams-meeting-ended
+  // listener, which is registered once (empty deps) and would otherwise
+  // only ever see the initial "idle" value due to closure capture.
+  const stateRef = useRef<SessionState>(state);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+
+  const redirectToReview = async () => {
+    try {
+      const meetings = await invoke<MeetingMetadata[]>("list_meetings");
+      if (meetings.length > 0) {
+        onMeetingEnded?.(meetings[0]);
+      }
+    } catch (err) {
+      console.error("[meeting] Failed to load meeting for review redirect:", err);
+    }
+  };
 
   useEffect(() => {
     const unlistenDetected = listen("teams-meeting-detected", () => {
-      // Only show the prompt if we're not already mid-decision or
-      // already in an active/dismissed state for this same meeting -
-      // prevents duplicate prompts (CLAUDE_INSTRUCTIONS.md §26).
       setState((prev) => (prev === "idle" ? "awaiting_decision" : prev));
     });
 
     const unlistenEnded = listen("teams-meeting-ended", () => {
-      // Reset fully - ready for the next distinct meeting.
+      const wasRecording = stateRef.current === "recording";
+      // Backend auto-stops any active recording on its own. Frontend
+      // just needs to reset so the indicator disappears and we're
+      // ready for the next meeting.
       setState("idle");
+      setElapsedSec(0);
+      if (wasRecording) {
+        redirectToReview();
+      }
     });
 
     return () => {
       unlistenDetected.then((f) => f());
       unlistenEnded.then((f) => f());
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleStart = () => {
-    // Placeholder only - real audio capture wiring happens in a later
-    // phase, once the dual-source recorder (DECISIONS.md #013-A) exists.
-    console.log("[meeting] Start Taking Notes selected (audio capture not yet wired - future phase)");
-    setState("active");
+  useEffect(() => {
+    if (state === "recording") {
+      setElapsedSec(0);
+      timerRef.current = window.setInterval(() => {
+        setElapsedSec((s) => s + 1);
+      }, 1000);
+    } else if (timerRef.current !== null) {
+      window.clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    return () => {
+      if (timerRef.current !== null) {
+        window.clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [state]);
+
+  const handleStart = async () => {
+    try {
+      const path = await invoke<string>("start_recording");
+      console.log("[meeting] Recording started, will save to:", path);
+      setState("recording");
+    } catch (err) {
+      console.error("[meeting] Failed to start recording:", err);
+      // Fail closed on the UI side too - do not claim we're recording
+      // if the backend call actually failed.
+      setState("dismissed");
+    }
   };
 
   const handleNotNow = () => {
@@ -49,30 +112,81 @@ export function MeetingNotification() {
     setState("dismissed");
   };
 
-  if (state !== "awaiting_decision") {
-    return null;
-  }
+  const handleStop = async () => {
+    try {
+      const path = await invoke<string>("stop_recording");
+      console.log("[meeting] Recording stopped, saved to:", path);
+      setLastSavedPath(path);
+      await redirectToReview();
+    } catch (err) {
+      console.error("[meeting] Failed to stop recording:", err);
+    } finally {
+      // Manual stop mid-meeting: go to "dismissed", not "idle", so we
+      // don't immediately re-prompt for the SAME still-ongoing meeting.
+      // Full reset to "idle" only happens on the real meeting-ended event.
+      setState("dismissed");
+    }
+  };
 
-  return (
-    <div style={overlayStyle}>
-      <div style={cardStyle}>
-        <h2 style={{ margin: "0 0 8px 0", fontSize: "16px" }}>
-          Teams meeting detected
-        </h2>
-        <p style={{ margin: "0 0 20px 0", color: "#555", fontSize: "14px" }}>
-          Would you like to take notes?
-        </p>
-        <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
-          <button onClick={handleNotNow} style={secondaryButtonStyle}>
-            Not Now
-          </button>
-          <button onClick={handleStart} style={primaryButtonStyle}>
-            Start Taking Notes
-          </button>
+  const formatElapsed = (totalSec: number) => {
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return `${m}m ${s.toString().padStart(2, "0")}s`;
+  };
+
+  if (state === "awaiting_decision") {
+    return (
+      <div style={overlayStyle}>
+        <div style={cardStyle}>
+          <h2 style={{ margin: "0 0 8px 0", fontSize: "16px" }}>
+            Teams meeting detected
+          </h2>
+          <p style={{ margin: "0 0 20px 0", color: "#6F7F98", fontSize: "14px" }}>
+            Would you like to take notes?
+          </p>
+          <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
+            <button onClick={handleNotNow} style={secondaryButtonStyle}>
+              Not Now
+            </button>
+            <button onClick={handleStart} style={primaryButtonStyle}>
+              Start Taking Notes
+            </button>
+          </div>
         </div>
       </div>
-    </div>
-  );
+    );
+  }
+
+  if (state === "recording") {
+    return (
+      <div>
+        <div style={indicatorBarStyle}>
+          <span style={{ color: "#C73636", fontWeight: 600 }}>● Recording</span>
+          <span style={{ color: "#6F7F98" }}>{formatElapsed(elapsedSec)}</span>
+          <button onClick={handleStop} style={stopButtonStyle}>
+            Stop &amp; Save
+          </button>
+        </div>
+        <NotesEditor />
+      </div>
+    );
+  }
+
+  if (state === "dismissed") {
+    return (
+      <div style={midMeetingBarStyle}>
+        <span style={{ color: "#6F7F98" }}>
+          {lastSavedPath ? `Last recording saved to: ${lastSavedPath}` : "Meeting in progress"}
+        </span>
+        <span style={{ flex: 1 }} />
+        <button onClick={handleStart} style={primaryButtonStyle}>
+          Start Taking Notes
+        </button>
+      </div>
+    );
+  }
+
+  return null;
 }
 
 const overlayStyle: React.CSSProperties = {
@@ -95,8 +209,28 @@ const cardStyle: React.CSSProperties = {
   width: "320px",
 };
 
+const midMeetingBarStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: "16px",
+  padding: "8px 16px",
+  background: "#F8FAFF",
+  borderBottom: "1px solid #DCE3F0",
+  fontSize: "12px",
+};
+
+const indicatorBarStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: "16px",
+  padding: "10px 16px",
+  background: "#FDF2F2",
+  borderBottom: "1px solid #F3D2D2",
+  fontSize: "13px",
+};
+
 const primaryButtonStyle: React.CSSProperties = {
-  background: "#4f46e5",
+  background: "#147DFF",
   color: "white",
   border: "none",
   borderRadius: "4px",
@@ -106,11 +240,22 @@ const primaryButtonStyle: React.CSSProperties = {
 };
 
 const secondaryButtonStyle: React.CSSProperties = {
-  background: "#f0f0f0",
-  color: "#333",
+  background: "#F1F3FF",
+  color: "#12244A",
   border: "none",
   borderRadius: "4px",
   padding: "8px 14px",
   cursor: "pointer",
   fontSize: "13px",
+};
+
+const stopButtonStyle: React.CSSProperties = {
+  background: "#C73636",
+  color: "white",
+  border: "none",
+  borderRadius: "4px",
+  padding: "6px 12px",
+  cursor: "pointer",
+  fontSize: "12px",
+  marginLeft: "auto",
 };

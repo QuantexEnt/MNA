@@ -1,0 +1,32 @@
+import { MeetingNotification } from "./components/MeetingNotification";
+import logo from "./assets/Horizontal-_MNA.png";
+
+// Persistent header shows the logo on every screen/state, unlike the
+// previous version which only showed it on the idle view. MeetingNotification
+// renders its own overlay/inline content below this depending on state.
+function App() {
+  return (
+    <div style={{ fontFamily: "Inter, -apple-system, sans-serif" }}>
+      <header
+        style={{
+          display: "flex",
+          alignItems: "center",
+          padding: "10px 16px",
+          borderBottom: "1px solid #DCE3F0",
+        }}
+      >
+        <img src={logo} alt="Meeting Notes Assistant" style={{ height: "24px" }} />
+      </header>
+
+      <MeetingNotification />
+
+      <div style={{ padding: "20px" }}>
+        <p style={{ color: "#6F7F98" }}>
+          Running in the background. Waiting for a Teams meeting...
+        </p>
+      </div>
+    </div>
+  );
+}
+
+export default App;

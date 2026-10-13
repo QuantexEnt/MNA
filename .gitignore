@@ -28,6 +28,7 @@ meetings/
 *.wav
 *.mp3
 transcript.json
+settings.json
 transcript.md
 notes.md
 mom.json

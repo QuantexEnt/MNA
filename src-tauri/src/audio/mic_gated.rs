@@ -3,11 +3,19 @@
 //! stream), but only writes REAL samples to the file while `is_unmuted`
 //! reads true; writes silence otherwise.
 //!
+//! FORMAT NOTE: this now takes an explicit target format (channels,
+//! sample rate, bits) rather than querying its own device's native mix
+//! format. Real testing found the default microphone and default output
+//! device can run at different native sample rates (44.1kHz vs 48kHz
+//! observed) - merging two streams recorded at different rates would
+//! produce corrupted audio, so the mic side is explicitly told to match
+//! the render device's rate instead. WASAPI shared mode's audio engine
+//! handles the resampling internally - we don't implement one ourselves.
+//!
 //! FAIL-CLOSED: if `is_unmuted` is false for ANY reason - genuinely
 //! muted, detector hasn't confirmed yet, or detector failed entirely -
 //! silence is written. Never real audio by default. DECISIONS.md #013-A.
 
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,13 +25,23 @@ use windows::Win32::Media::Audio::{
     MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
+
+// Standard WAVE_FORMAT_IEEE_FLOAT value (3), hardcoded rather than
+// imported - a prior attempt to import this named constant from
+// windows::Win32::Media::Audio failed to compile against this crate
+// version (see project history). The numeric value itself is a fixed
+// part of the Microsoft multimedia format spec and does not change.
+const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 
 pub fn run_gated_mic_capture(
     output_path: String,
     is_unmuted: Arc<AtomicBool>,
     should_stop: Arc<AtomicBool>,
+    target_channels: u16,
+    target_sample_rate: u32,
+    target_bits_per_sample: u16,
 ) -> windows::core::Result<()> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok()?;
 
@@ -32,11 +50,26 @@ pub fn run_gated_mic_capture(
     let device = unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)? };
     let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
 
-    let wf_ptr = unsafe { audio_client.GetMixFormat()? };
-    let wf: WAVEFORMATEX = unsafe { *wf_ptr };
+    let block_align = target_channels * (target_bits_per_sample / 8);
+    let wf = WAVEFORMATEX {
+        wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+        nChannels: target_channels,
+        nSamplesPerSec: target_sample_rate,
+        nAvgBytesPerSec: target_sample_rate * block_align as u32,
+        nBlockAlign: block_align,
+        wBitsPerSample: target_bits_per_sample,
+        cbSize: 0,
+    };
 
     unsafe {
-        audio_client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 10_000_000, 0, wf_ptr, None)?;
+        audio_client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            0,
+            10_000_000,
+            0,
+            &wf as *const WAVEFORMATEX,
+            None,
+        )?;
     }
 
     let capture_client: IAudioCaptureClient = unsafe { audio_client.GetService()? };
@@ -71,8 +104,6 @@ pub fn run_gated_mic_capture(
             let frame_bytes = wf.nBlockAlign as usize;
             let is_silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
 
-            // The actual gate: only pass real samples through while we
-            // have positive confirmation the mic is unmuted.
             let gate_open = is_unmuted.load(Ordering::SeqCst);
 
             if num_frames > 0 {
@@ -97,6 +128,5 @@ pub fn run_gated_mic_capture(
 
     unsafe { audio_client.Stop()? };
     let _ = writer.finalize();
-    unsafe { CoTaskMemFree(Some(wf_ptr as *const c_void)) };
     Ok(())
 }

@@ -1,0 +1,56 @@
+//! Application settings. Persisted as plain JSON in the app's local
+//! data directory (via paths::settings_path()), not inside the project
+//! folder - correct on any machine the built app runs on, not just
+//! this dev machine.
+//!
+//! CRITICAL: settings.json contains the OpenAI API key.
+//! (DECISIONS.md #026).
+//!
+//! KNOWN LIMITATION (SECURITY_AND_PRIVACY.md §14): plain-JSON key storage
+//! is a prototype-only limitation. Before any wider distribution, this
+//! should move to a proper OS secure-credential store (e.g. Windows
+//! Credential Manager). Acceptable for personal V1 use only.
+
+use serde::{Deserialize, Serialize};
+use std::fs;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    pub openai_api_key: String,
+    pub transcription_model: String,
+    pub mom_model: String,
+    pub start_with_windows: bool,
+    pub meeting_notifications: bool,
+    pub license_key: String,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        AppSettings {
+            openai_api_key: String::new(),
+            transcription_model: "gpt-4o-transcribe-diarize".to_string(),
+            mom_model: "gpt-4o-mini".to_string(),
+            start_with_windows: false,
+            meeting_notifications: true,
+            license_key: String::new(),
+        }
+    }
+}
+
+#[tauri::command]
+pub fn load_settings() -> Result<AppSettings, String> {
+    let path = crate::paths::settings_path();
+    if !path.exists() {
+        return Ok(AppSettings::default());
+    }
+    let content = fs::read_to_string(&path).map_err(|e| format!("read settings.json: {e}"))?;
+    serde_json::from_str(&content).map_err(|e| format!("parse settings.json: {e}"))
+}
+
+#[tauri::command]
+pub fn save_settings(settings: AppSettings) -> Result<(), String> {
+    let path = crate::paths::settings_path();
+    let json =
+        serde_json::to_string_pretty(&settings).map_err(|e| format!("serialize settings: {e}"))?;
+    fs::write(&path, json).map_err(|e| format!("write settings.json: {e}"))
+}

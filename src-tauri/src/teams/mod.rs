@@ -185,6 +185,18 @@ fn poll_once(current: &mut DetectorState, app: &AppHandle) {
             // count as "meeting ended" - covers Teams closing abruptly
             // mid-meeting too (USER_FLOW.md §14).
             let _ = app.emit("teams-meeting-ended", ());
+
+            // Auto-stop: if a recording is still running when the
+            // meeting ends, stop and save it now rather than leaving it
+            // running silently (this is the exact gap found during
+            // manual testing - DECISIONS.md #038 requires visible,
+            // bounded recording state).
+            if let Some(result) = crate::audio::stop_recording_if_active() {
+                match result {
+                    Ok(path) => println!("[audio] Auto-stopped on meeting end. Saved to: {path}"),
+                    Err(e) => eprintln!("[audio] Auto-stop failed: {e}"),
+                }
+            }
         }
 
         *current = new_state;

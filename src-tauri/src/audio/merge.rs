@@ -39,15 +39,37 @@ pub fn merge_wav_files(
 
     let len = loopback_samples.len().max(mic_samples.len());
 
-    let mut writer =
-        hound::WavWriter::create(output_path, spec).map_err(|e| format!("create output: {e}"))?;
-
+    // Sum first (unclamped) so we can find the true peak before deciding
+    // how much to boost the overall level.
+    let mut mixed: Vec<f32> = Vec::with_capacity(len);
+    let mut peak: f32 = 0.0;
     for i in 0..len {
         let a = loopback_samples.get(i).copied().unwrap_or(0.0);
         let b = mic_samples.get(i).copied().unwrap_or(0.0);
-        let mixed = (a + b).clamp(-1.0, 1.0);
+        let s = a + b;
+        if s.abs() > peak {
+            peak = s.abs();
+        }
+        mixed.push(s);
+    }
+
+    // Peak normalize: raw mic capture bypasses Teams' own automatic gain
+    // control, so combined levels are often much quieter than what call
+    // participants actually heard live. Boost so the loudest point
+    // reaches near full scale - unless the recording is near-total
+    // silence, in which case there's nothing meaningful to boost and
+    // doing so would just amplify noise floor pointlessly.
+    const TARGET_PEAK: f32 = 0.95;
+    const SILENCE_FLOOR: f32 = 0.001;
+    let gain = if peak > SILENCE_FLOOR { TARGET_PEAK / peak } else { 1.0 };
+
+    let mut writer =
+        hound::WavWriter::create(output_path, spec).map_err(|e| format!("create output: {e}"))?;
+
+    for s in mixed {
+        let boosted = (s * gain).clamp(-1.0, 1.0);
         writer
-            .write_sample(mixed)
+            .write_sample(boosted)
             .map_err(|e| format!("write sample: {e}"))?;
     }
 
